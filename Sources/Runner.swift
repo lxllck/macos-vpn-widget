@@ -16,6 +16,9 @@ struct RunResult {
     let output: String
     let timedOut: Bool
     let unansweredPrompt: Bool
+    /// Процесс не удалось снять даже через sudo — о таком надо сказать
+    /// вслух, иначе рядом останется висеть чужой openconnect.
+    var killFailed: Bool = false
     var succeeded: Bool { exitCode == 0 && !timedOut }
 }
 
@@ -86,25 +89,71 @@ enum Runner {
         var pending = answers
         let readerDone = DispatchSemaphore(value: 0)
 
+        let redact: (String) -> String = { text in
+            var t = text
+            for step in answers where step.secret && !step.reply.isEmpty {
+                t = t.replacingOccurrences(of: step.reply, with: "•••")
+            }
+            return t
+        }
+
         DispatchQueue.global(qos: .userInitiated).async {
             var buf = [UInt8](repeating: 0, count: 4096)
+            var lineBuf = ""
             while true {
                 let n = read(master, &buf, buf.count)
                 if n <= 0 { break }   // мастер закрыт или потомок ушёл
+                // Приводим переводы строк сразу на входе. Псевдотерминал
+                // отдаёт "\r\n", а Swift считает это одним символом, не
+                // равным "\n": без нормализации не работают ни поиск строк,
+                // ни проверка «вывод не заканчивается переводом строки»,
+                // по которой мы отличаем промпт от обычного сообщения.
                 let chunk = String(decoding: buf[0..<n], as: UTF8.self)
+                    .replacingOccurrences(of: "\r\n", with: "\n")
+                    .replacingOccurrences(of: "\r", with: "\n")
                 lock.lock()
                 collected += chunk
                 tail += chunk
+                lineBuf += chunk
+
+                // Сначала снимаем из буфера все завершённые строки — тогда
+                // в lineBuf остаётся ровно незавершённый хвост, то есть
+                // потенциальный промпт.
+                var lines: [String] = []
+                while let nl = lineBuf.firstIndex(of: "\n") {
+                    let line = String(lineBuf[lineBuf.startIndex..<nl])
+                        .trimmingCharacters(in: .whitespaces)
+                    lineBuf = String(lineBuf[lineBuf.index(after: nl)...])
+                    if !line.isEmpty { lines.append(line) }
+                }
+
+                // Отвечаем, только когда программа действительно ждёт ввода.
+                // Настоящий промпт не заканчивается переводом строки, а
+                // информационные строки — заканчиваются. Это принципиально:
+                // openconnect печатает "Please enter your username and
+                // password." задолго до промпта "Password:", и ответ на неё
+                // уходил в пустоту — перед запросом пароля openconnect делает
+                // tcsetattr(TCSAFLUSH) и отбрасывает всё, что пришло раньше.
+                var answered: String? = nil
                 if let step = pending.first,
+                   !tail.hasSuffix("\n"),
                    tail.range(of: step.pattern, options: .regularExpression) != nil {
-                    let line = step.reply + "\n"
-                    _ = line.withCString { write(master, $0, strlen($0)) }
+                    let reply = step.reply + "\n"
+                    _ = reply.withCString { write(master, $0, strlen($0)) }
                     pending.removeFirst()
+                    answered = lineBuf.trimmingCharacters(in: .whitespaces)
                     tail = ""
+                    lineBuf = ""
                 }
                 if tail.count > 4096 { tail = String(tail.suffix(2048)) }
                 lock.unlock()
-                onOutput?(chunk)
+
+                // Пишем в лог по мере поступления, а не одним куском в конце:
+                // при зависании только это и показывает, на чём мы стоим.
+                for line in lines { onOutput?(redact(line)) }
+                if let prompt = answered {
+                    onOutput?("[промпт «\(prompt)» — ответ отправлен]")
+                }
             }
             readerDone.signal()
         }
@@ -113,18 +162,15 @@ enum Runner {
         let deadline = Date().addingTimeInterval(timeout)
         var status: Int32 = 0
         var timedOut = false
+        var killed = true
         while true {
             let r = waitpid(pid, &status, WNOHANG)
             if r == pid { break }
             if r < 0 { break }
             if Date() >= deadline {
                 timedOut = true
-                kill(pid, SIGTERM)
-                usleep(500_000)
-                if waitpid(pid, &status, WNOHANG) != pid {
-                    kill(pid, SIGKILL)
-                    _ = waitpid(pid, &status, 0)
-                }
+                onOutput?("[таймаут — снимаю процесс]")
+                killed = terminate(group: pid)
                 break
             }
             usleep(50_000)
@@ -149,7 +195,46 @@ enum Runner {
             (status & 0x7f) == 0 ? (status >> 8) & 0xff : -(status & 0x7f)
 
         return RunResult(exitCode: code, output: out.trimmingCharacters(in: .whitespacesAndNewlines),
-                         timedOut: timedOut, unansweredPrompt: leftover > 0)
+                         timedOut: timedOut, unansweredPrompt: leftover > 0,
+                         killFailed: !killed)
+    }
+
+    /// Снимает всю группу процессов и дожидается её исчезновения.
+    ///
+    /// Два момента, на которых прошлая версия ломалась насмерть:
+    /// потомок — это sudo, то есть root, и обычный kill от имени пользователя
+    /// возвращает EPERM; а безусловный `waitpid(pid, &status, 0)` после
+    /// неудачного kill блокировал очередь навсегда и вешал весь виджет.
+    /// Поэтому снимаем через sudo и ждём строго ограниченное время.
+    @discardableResult
+    private static func terminate(group pid: pid_t) -> Bool {
+        // Отрицательный pid = вся группа: сам скрипт уже мог породить
+        // собственный `sudo openconnect`, который иначе остался бы сиротой.
+        for signal in ["-TERM", "-KILL"] {
+            _ = runQuiet(["/usr/bin/sudo", "-n", "/bin/kill", signal, "-\(pid)"])
+            _ = runQuiet(["/usr/bin/sudo", "-n", "/bin/kill", signal, "\(pid)"])
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                var st: Int32 = 0
+                if waitpid(pid, &st, WNOHANG) == pid { return true }
+                if kill(pid, 0) != 0 && errno == ESRCH { return true }
+                usleep(100_000)
+            }
+        }
+        return false
+    }
+
+    /// Короткая вспомогательная команда без псевдотерминала.
+    @discardableResult
+    private static func runQuiet(_ argv: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: argv[0])
+        p.arguments = Array(argv.dropFirst())
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
     }
 
     /// Полная таблица процессов одним вызовом — дешевле, чем дёргать

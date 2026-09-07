@@ -80,7 +80,11 @@ final class VPNMonitor: ObservableObject {
     private let backoff: [TimeInterval] = [5, 15, 45, 120, 300]
 
     private let config: AppConfig
-    private let work = DispatchQueue(label: "vpnwidget.poll", qos: .utility)
+    /// Очереди разделены намеренно: подключение может выполняться минуту и
+    /// более, а на общей последовательной очереди оно останавливало опрос —
+    /// виджет замирал целиком и переставал показывать состояние.
+    private let pollQueue = DispatchQueue(label: "vpnwidget.poll", qos: .utility)
+    private let cmdQueue = DispatchQueue(label: "vpnwidget.cmd", qos: .userInitiated)
     private var timer: Timer?
     private var firstPollDone = false
     /// Сколько опросов подряд туннель в degraded — одиночный сбой пробы
@@ -135,7 +139,7 @@ final class VPNMonitor: ObservableObject {
         let snapshot = vpns.map { ($0.spec, $0.lastProbeAt, $0.busy) }
         let interval = config.probeIntervalSec
 
-        work.async { [weak self] in
+        pollQueue.async { [weak self] in
             let table = Runner.processTable()
             var results: [Observation] = []
 
@@ -375,14 +379,16 @@ final class VPNMonitor: ObservableObject {
         let cmd = argv(for: spec, args: spec.startArgs)
         Log.shared.info("\(spec.title): запуск \(spec.command) \(spec.startArgs.joined(separator: " "))")
 
+        let title = spec.title
         let result = await withCheckedContinuation { (c: CheckedContinuation<RunResult, Never>) in
-            work.async {
-                c.resume(returning: Runner.runPTY(argv: cmd, env: ["PATH": self.config.childPath],
-                                                  answers: steps, timeout: timeout))
+            cmdQueue.async {
+                c.resume(returning: Runner.runPTY(
+                    argv: cmd, env: ["PATH": self.config.childPath],
+                    answers: steps, timeout: timeout,
+                    // Пишем по мере поступления: если подключение зависнет,
+                    // только это и покажет, на каком промпте оно стоит.
+                    onOutput: { Log.shared.info("  \(title)| \($0)") }))
             }
-        }
-        for line in result.output.split(separator: "\n") {
-            Log.shared.info("  \(spec.title)| \(line)")
         }
 
         var error: String? = nil
@@ -407,8 +413,11 @@ final class VPNMonitor: ObservableObject {
         if out.contains("command not found") {
             return "Не найден sshuttle/openconnect — проверьте PATH в config.json"
         }
+        if r.killFailed {
+            return "Процесс завис и не снимается — проверьте лог и pkill openconnect"
+        }
         if r.unansweredPrompt {
-            return "Сервер запросил что-то помимо пароля и OTP — смотрите лог"
+            return "Промпт не распознан — точный текст в логе, шаблон правится в config.json"
         }
         let tail = r.output.split(separator: "\n").suffix(2).joined(separator: " ")
         return tail.isEmpty ? "Код возврата \(r.exitCode)" : String(tail.prefix(160))
@@ -428,14 +437,14 @@ final class VPNMonitor: ObservableObject {
 
         let cmd = argv(for: spec, args: spec.stopArgs)
         Log.shared.info("\(spec.title): остановка")
-        let result = await withCheckedContinuation { (c: CheckedContinuation<RunResult, Never>) in
-            work.async {
-                c.resume(returning: Runner.runPTY(argv: cmd, env: ["PATH": self.config.childPath],
-                                                  answers: [], timeout: 30))
+        let title = spec.title
+        _ = await withCheckedContinuation { (c: CheckedContinuation<RunResult, Never>) in
+            cmdQueue.async {
+                c.resume(returning: Runner.runPTY(
+                    argv: cmd, env: ["PATH": self.config.childPath],
+                    answers: [], timeout: 30,
+                    onOutput: { Log.shared.info("  \(title)| \($0)") }))
             }
-        }
-        for line in result.output.split(separator: "\n") where !line.isEmpty {
-            Log.shared.info("  \(spec.title)| \(line)")
         }
         // pkill возвращает 1, если убивать было нечего — это не ошибка.
         finish(i, error: nil)

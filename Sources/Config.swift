@@ -96,9 +96,14 @@ struct AppConfig: Codable {
                 // коннект доказывает, что туннель openconnect действительно жив.
                 probe: ProbeSpec(host: "10.0.0.1", port: 3389,
                                  timeoutMs: 5000, expectBanner: true),
+                // Шаблоны обязаны совпадать с настоящим промптом, а не с
+                // упоминанием слова: openconnect печатает "Please enter your
+                // username and password." задолго до "Password:". Промпт
+                // распознаётся ещё и по тому, что вывод не заканчивается
+                // переводом строки (см. Runner).
                 auth: AuthSpec(user: "your-user",
-                               passwordPrompt: #"(?i)password"#,
-                               otpPrompt: #"(?i)(otp|token|code|passcode|answer|password|second)"#,
+                               passwordPrompt: #"(?i)password[^\n]*:\s*$"#,
+                               otpPrompt: #"(?i)(otp|token|code|passcode|answer|challenge|password|second)[^\n]*:\s*$"#,
                                timeoutSec: 120),
                 // Требует свежий OTP — автоматически поднять нельзя.
                 autoReconnectAllowed: false
