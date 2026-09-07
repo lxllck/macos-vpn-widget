@@ -190,7 +190,8 @@ struct PanelView: View {
             HStack(spacing: 10) {
                 if let auth = monitor.vpns.compactMap({ $0.spec.auth }).first {
                     if Keychain.has(account: auth.user) {
-                        Button("Удалить пароль Aton") {
+                        Button("Изменить пароль") { beginPasswordChange(auth) }
+                        Button("Удалить пароль") {
                             Keychain.delete(account: auth.user)
                             monitor.objectWillChange.send()
                         }
@@ -227,8 +228,19 @@ struct PanelView: View {
             Task { await monitor.connect(id: vpn.id, otp: nil) }
             return
         }
-        needPassword = !Keychain.has(account: auth.user)
+        // После отказа сервера пароль из связки ключей заведомо не подошёл —
+        // спрашиваем заново, иначе повторили бы ту же неверную попытку.
+        needPassword = !Keychain.has(account: auth.user) || vpn.authFailed
         otp = ""; password = ""
+        authTarget = vpn.id
+    }
+
+    /// Открывает форму с полем пароля, не дожидаясь неудачной попытки.
+    private func beginPasswordChange(_ auth: AuthSpec) {
+        guard let vpn = monitor.vpns.first(where: { $0.spec.auth?.user == auth.user })
+        else { return }
+        otp = ""; password = ""
+        needPassword = true
         authTarget = vpn.id
     }
 

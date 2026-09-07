@@ -57,6 +57,9 @@ struct VPNRuntime: Identifiable, Equatable {
         procs.filter { $0.up }.compactMap { $0.ageSec }.min()
     }
     var lastError: String? = nil
+    /// Сервер отклонил вход — значит при следующей попытке надо спросить
+    /// пароль заново, а не молча брать из связки ключей тот же неверный.
+    var authFailed = false
     var busy = false
 
     /// Чего хочет пользователь. Автопереподключение работает только при
@@ -228,6 +231,7 @@ final class VPNMonitor: ObservableObject {
             vpns[i].status = newStatus
 
             if newStatus == .connected {
+                vpns[i].authFailed = false
                 if vpns[i].connectedSince == nil { vpns[i].connectedSince = Date() }
                 vpns[i].reconnectAttempts = 0
                 vpns[i].nextReconnectAt = nil
@@ -384,12 +388,15 @@ final class VPNMonitor: ObservableObject {
             cmdQueue.async {
                 c.resume(returning: Runner.runPTY(
                     argv: cmd, env: ["PATH": self.config.childPath],
-                    answers: steps, timeout: timeout,
+                    answers: steps, failurePattern: spec.auth?.failureRegex,
+                    timeout: timeout,
                     // Пишем по мере поступления: если подключение зависнет,
                     // только это и покажет, на каком промпте оно стоит.
                     onOutput: { Log.shared.info("  \(title)| \($0)") }))
             }
         }
+
+        vpns[i].authFailed = result.failureReason != nil
 
         var error: String? = nil
         if result.timedOut {
@@ -402,6 +409,11 @@ final class VPNMonitor: ObservableObject {
 
     /// Вывод openconnect многословный — вытаскиваем то, что объясняет отказ.
     private static func explain(_ r: RunResult, spec: VPNSpec) -> String {
+        // Отказ сервера — самая частая причина, и он должен называться
+        // прямо, а не прятаться за «код возврата» или таймаутом.
+        if let reason = r.failureReason {
+            return "Сервер отклонил вход: \(reason) Проверьте пароль и код OTP."
+        }
         let out = r.output.lowercased()
         if out.contains("a password is required") || out.contains("sudo:") {
             return "sudo отказал в правах — проверьте NOPASSWD в /etc/sudoers"

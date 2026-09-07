@@ -16,10 +16,12 @@ struct RunResult {
     let output: String
     let timedOut: Bool
     let unansweredPrompt: Bool
+    /// Строка, которой сервер отказал во входе (если отказал).
+    var failureReason: String? = nil
     /// Процесс не удалось снять даже через sudo — о таком надо сказать
     /// вслух, иначе рядом останется висеть чужой openconnect.
     var killFailed: Bool = false
-    var succeeded: Bool { exitCode == 0 && !timedOut }
+    var succeeded: Bool { exitCode == 0 && !timedOut && failureReason == nil }
 }
 
 enum Runner {
@@ -36,6 +38,7 @@ enum Runner {
     static func runPTY(argv: [String],
                        env extraEnv: [String: String],
                        answers: [AnswerStep],
+                       failurePattern: String? = nil,
                        timeout: Double,
                        onOutput: ((String) -> Void)? = nil) -> RunResult {
 
@@ -86,7 +89,10 @@ enum Runner {
         let lock = NSLock()
         var collected = ""
         var tail = ""
+        /// Незавершённая строка — то, на чём мы стоим, если всё зависнет.
+        var pendingPrompt = ""
         var pending = answers
+        var failureReason: String? = nil
         let readerDone = DispatchSemaphore(value: 0)
 
         let redact: (String) -> String = { text in
@@ -97,63 +103,91 @@ enum Runner {
             return t
         }
 
+        // «Программа ждёт ввода» определяется двумя сигналами: вывод не
+        // заканчивается переводом строки (промпт вида "Password:") ИЛИ поток
+        // замолчал (промпт вида "OTP\n" — с переводом строки). Одного первого
+        // мало: сервер печатает запрос второго фактора отдельной строкой,
+        // и ответ не отправлялся никогда.
         DispatchQueue.global(qos: .userInitiated).async {
             var buf = [UInt8](repeating: 0, count: 4096)
-            var lineBuf = ""
+            var lastData = Date()
+
+            // Шаблон проверяем по последней непустой строке, а не по всему
+            // выводу: иначе "Please enter your username and password."
+            // сойдёт за промпт пароля.
+            func lastLine(_ s: String) -> String {
+                s.split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .last { !$0.isEmpty } ?? ""
+            }
+
+            func tryAnswer(idle: Bool) {
+                lock.lock()
+                guard failureReason == nil, let step = pending.first else {
+                    lock.unlock(); return
+                }
+                let line = lastLine(tail)
+                guard idle || !tail.hasSuffix("\n"), !line.isEmpty,
+                      line.range(of: step.pattern, options: .regularExpression) != nil else {
+                    lock.unlock(); return
+                }
+                let reply = step.reply + "\n"
+                _ = reply.withCString { write(master, $0, strlen($0)) }
+                pending.removeFirst()
+                tail = ""
+                pendingPrompt = ""
+                lock.unlock()
+                onOutput?("[промпт «\(line)» — ответ отправлен]")
+            }
+
             while true {
+                var pfd = pollfd(fd: master, events: Int16(POLLIN), revents: 0)
+                let pr = poll(&pfd, 1, 200)
+                if pr < 0 { if errno == EINTR { continue }; break }
+                if pr == 0 {
+                    if Date().timeIntervalSince(lastData) > 0.6 { tryAnswer(idle: true) }
+                    continue
+                }
                 let n = read(master, &buf, buf.count)
                 if n <= 0 { break }   // мастер закрыт или потомок ушёл
+                lastData = Date()
+
                 // Приводим переводы строк сразу на входе. Псевдотерминал
                 // отдаёт "\r\n", а Swift считает это одним символом, не
-                // равным "\n": без нормализации не работают ни поиск строк,
-                // ни проверка «вывод не заканчивается переводом строки»,
-                // по которой мы отличаем промпт от обычного сообщения.
+                // равным "\n": без нормализации не работает ни разбор строк,
+                // ни проверка на промпт.
                 let chunk = String(decoding: buf[0..<n], as: UTF8.self)
                     .replacingOccurrences(of: "\r\n", with: "\n")
                     .replacingOccurrences(of: "\r", with: "\n")
+
                 lock.lock()
                 collected += chunk
                 tail += chunk
-                lineBuf += chunk
+                pendingPrompt += chunk
 
-                // Сначала снимаем из буфера все завершённые строки — тогда
-                // в lineBuf остаётся ровно незавершённый хвост, то есть
-                // потенциальный промпт.
+                // Снимаем завершённые строки; в pendingPrompt остаётся
+                // незавершённый хвост — им же объясняем зависание.
                 var lines: [String] = []
-                while let nl = lineBuf.firstIndex(of: "\n") {
-                    let line = String(lineBuf[lineBuf.startIndex..<nl])
+                while let nl = pendingPrompt.firstIndex(of: "\n") {
+                    let line = String(pendingPrompt[pendingPrompt.startIndex..<nl])
                         .trimmingCharacters(in: .whitespaces)
-                    lineBuf = String(lineBuf[lineBuf.index(after: nl)...])
+                    pendingPrompt = String(pendingPrompt[pendingPrompt.index(after: nl)...])
                     if !line.isEmpty { lines.append(line) }
                 }
 
-                // Отвечаем, только когда программа действительно ждёт ввода.
-                // Настоящий промпт не заканчивается переводом строки, а
-                // информационные строки — заканчиваются. Это принципиально:
-                // openconnect печатает "Please enter your username and
-                // password." задолго до промпта "Password:", и ответ на неё
-                // уходил в пустоту — перед запросом пароля openconnect делает
-                // tcsetattr(TCSAFLUSH) и отбрасывает всё, что пришло раньше.
-                var answered: String? = nil
-                if let step = pending.first,
-                   !tail.hasSuffix("\n"),
-                   tail.range(of: step.pattern, options: .regularExpression) != nil {
-                    let reply = step.reply + "\n"
-                    _ = reply.withCString { write(master, $0, strlen($0)) }
-                    pending.removeFirst()
-                    answered = lineBuf.trimmingCharacters(in: .whitespaces)
-                    tail = ""
-                    lineBuf = ""
+                // Отказ сервера ловим до того, как ответим на повторный
+                // промпт: иначе следующая заготовленная строка ушла бы как
+                // ещё одна неверная попытка входа.
+                if failureReason == nil, let fp = failurePattern {
+                    failureReason = lines.first {
+                        $0.range(of: fp, options: .regularExpression) != nil
+                    }
                 }
-                if tail.count > 4096 { tail = String(tail.suffix(2048)) }
+                if tail.count > 8192 { tail = String(tail.suffix(4096)) }
                 lock.unlock()
 
-                // Пишем в лог по мере поступления, а не одним куском в конце:
-                // при зависании только это и показывает, на чём мы стоим.
                 for line in lines { onOutput?(redact(line)) }
-                if let prompt = answered {
-                    onOutput?("[промпт «\(prompt)» — ответ отправлен]")
-                }
+                tryAnswer(idle: false)
             }
             readerDone.signal()
         }
@@ -167,6 +201,12 @@ enum Runner {
             let r = waitpid(pid, &status, WNOHANG)
             if r == pid { break }
             if r < 0 { break }
+            lock.lock(); let rejected = failureReason; lock.unlock()
+            if let reason = rejected {
+                onOutput?("[сервер отклонил вход («\(reason)») — прерываю, чтобы не повторять попытки]")
+                killed = terminate(group: pid)
+                break
+            }
             if Date() >= deadline {
                 timedOut = true
                 onOutput?("[таймаут — снимаю процесс]")
@@ -182,7 +222,15 @@ enum Runner {
         lock.lock()
         var out = collected
         let leftover = pending.count
+        let rejection = failureReason
+        let stuckOn = pendingPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.unlock()
+
+        // Без этого зависание не разобрать: незавершённый промпт никогда
+        // не попадал в лог, потому что туда шли только целые строки.
+        if leftover > 0 && !stuckOn.isEmpty {
+            onOutput?("[осталось без ответа, ожидание на «\(stuckOn)»]")
+        }
 
         // Секреты (в т.ч. эхо OTP из терминала) не должны попасть в лог.
         for step in answers where step.secret && !step.reply.isEmpty {
@@ -196,7 +244,7 @@ enum Runner {
 
         return RunResult(exitCode: code, output: out.trimmingCharacters(in: .whitespacesAndNewlines),
                          timedOut: timedOut, unansweredPrompt: leftover > 0,
-                         killFailed: !killed)
+                         failureReason: rejection, killFailed: !killed)
     }
 
     /// Снимает всю группу процессов и дожидается её исчезновения.

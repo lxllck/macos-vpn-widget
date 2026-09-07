@@ -27,7 +27,19 @@ struct AuthSpec: Codable, Equatable {
     var user: String
     var passwordPrompt: String
     var otpPrompt: String
+    /// Ответ сервера об отказе. Распознавать его обязательно: при неверном
+    /// пароле openconnect не завершается, а молча спрашивает заново. Без
+    /// этого виджет ждал бы таймаут, успев отправить следующий ответ на
+    /// повторный промпт — то есть сделать ещё одну неверную попытку и
+    /// приблизить блокировку учётной записи.
+    var failurePattern: String?
     var timeoutSec: Double
+
+    static let defaultFailurePattern =
+        #"(?i)(login failed|authentication (failed|failure)|access denied|invalid (password|credentials|username))"#
+
+    /// Старые конфиги без этого поля получают поведение по умолчанию.
+    var failureRegex: String { failurePattern ?? Self.defaultFailurePattern }
 }
 
 struct VPNSpec: Codable, Equatable {
@@ -102,8 +114,9 @@ struct AppConfig: Codable {
                 // распознаётся ещё и по тому, что вывод не заканчивается
                 // переводом строки (см. Runner).
                 auth: AuthSpec(user: "your-user",
-                               passwordPrompt: #"(?i)password[^\n]*:\s*$"#,
-                               otpPrompt: #"(?i)(otp|token|code|passcode|answer|challenge|password|second)[^\n]*:\s*$"#,
+                               passwordPrompt: #"(?i)^password\b[^\n]{0,40}$"#,
+                               otpPrompt: #"(?i)^(otp|token|code|passcode|answer|challenge|verification|second|password)\b[^\n]{0,40}$"#,
+                               failurePattern: AuthSpec.defaultFailurePattern,
                                timeoutSec: 120),
                 // Требует свежий OTP — автоматически поднять нельзя.
                 autoReconnectAllowed: false
