@@ -48,6 +48,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// Управление автозапуском из командной строки — им же проверяется, что
+// регистрация действительно прошла:
+//   /Applications/VPNWidget.app/Contents/MacOS/VPNWidget --login-item status|on|off
+if let i = CommandLine.arguments.firstIndex(of: "--login-item") {
+    let action = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : "status"
+    switch action {
+    case "on":  LoginItem.set(true)
+    case "off": LoginItem.set(false)
+    default:    break
+    }
+    print("автозапуск: \(LoginItem.statusText)")
+    exit(LoginItem.status == .enabled || action == "off" ? 0 : 1)
+}
+
 // NSApplication.delegate — weak-ссылка, поэтому делегат держим глобально.
 nonisolated(unsafe) var retainedDelegate: AppDelegate?
 

@@ -9,6 +9,7 @@ struct PanelView: View {
     @State private var password = ""
     @State private var needPassword = false
     @State private var launchAtLogin = LoginItem.isEnabled
+    @State private var loginNeedsApproval = LoginItem.needsApproval
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -21,6 +22,12 @@ struct PanelView: View {
             footer
         }
         .frame(width: 340)
+        // Автозапуск можно выключить и снаружи — в Системных настройках,
+        // поэтому состояние галочки перечитываем при каждом открытии панели.
+        .onAppear {
+            launchAtLogin = LoginItem.isEnabled
+            loginNeedsApproval = LoginItem.needsApproval
+        }
     }
 
     // MARK: Заголовок
@@ -159,12 +166,26 @@ struct PanelView: View {
                 .toggleStyle(.checkbox)
                 .font(.system(size: 11))
 
-            Toggle("Запускать при входе в систему", isOn: $launchAtLogin)
-                .toggleStyle(.checkbox)
-                .font(.system(size: 11))
-                .onChange(of: launchAtLogin) { _, v in
-                    if !LoginItem.set(v) { launchAtLogin = LoginItem.isEnabled }
+            VStack(alignment: .leading, spacing: 3) {
+                Toggle("Запускать при входе в систему", isOn: $launchAtLogin)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 11))
+                    .onChange(of: launchAtLogin) { _, v in
+                        LoginItem.set(v)
+                        // Показываем то, что реально записала система,
+                        // а не то, что мы у неё попросили.
+                        launchAtLogin = LoginItem.isEnabled
+                        loginNeedsApproval = LoginItem.needsApproval
+                    }
+                if loginNeedsApproval {
+                    HStack(spacing: 6) {
+                        Text("Запрещён в Системных настройках")
+                            .font(.system(size: 10)).foregroundStyle(.orange)
+                        Button("Открыть") { LoginItem.openSystemSettings() }
+                            .controlSize(.mini)
+                    }
                 }
+            }
 
             HStack(spacing: 10) {
                 if let auth = monitor.vpns.compactMap({ $0.spec.auth }).first {
