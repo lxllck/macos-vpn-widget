@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.onChange = { [weak self] in self?.refreshStatusItem() }
         monitor.start()
         refreshStatusItem()
+
     }
 
     private func refreshStatusItem() {
@@ -34,17 +35,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.toolTip = MenuBarTitle.tooltip(monitor.vpns)
     }
 
+    /// Ставит панель под элемент строки меню.
+    ///
+    /// Своими силами, потому что NSPopover здесь игнорирует и якорный
+    /// прямоугольник, и preferredEdge: замеры дали одно и то же положение
+    /// для всех четырёх вариантов, причём панель перекрывала строку меню
+    /// целиком и вылезала за верх экрана.
+    private func anchorPopover(to button: NSStatusBarButton) {
+        guard let view = popover.contentViewController?.view,
+              let win = view.window,
+              let buttonWindow = button.window,
+              let screen = buttonWindow.screen ?? NSScreen.main else { return }
+
+        let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        let content = win.convertToScreen(view.convert(view.bounds, to: nil))
+        // Вокруг содержимого есть прозрачное поле под тень — без его учёта
+        // панель встанет со смещением на его толщину.
+        let padTop = win.frame.maxY - content.maxY
+        let padLeft = content.minX - win.frame.minX
+        let visible = screen.visibleFrame
+
+        // Верх содержимого — под строкой меню, даже если кнопка выше неё.
+        let top = min(buttonRect.minY, visible.maxY) - 2
+        var x = buttonRect.midX - content.width / 2 - padLeft
+        // У края экрана панель сдвигается внутрь, а не обрезается.
+        x = min(max(x, visible.minX + 6), visible.maxX - win.frame.width - 6)
+
+        win.setFrameOrigin(NSPoint(x: x, y: top + padTop - win.frame.height))
+    }
+
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
-        } else {
-            monitor.poll(forceProbe: true)
-            // Без активации поля ввода OTP не получают фокус клавиатуры.
-            NSApp.activate(ignoringOtherApps: true)
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            return
         }
+        monitor.poll(forceProbe: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        anchorPopover(to: button)
+        // Без активации поля ввода OTP не получают фокус клавиатуры.
+        NSApp.activate(ignoringOtherApps: true)
+        popover.contentViewController?.view.window?.makeKey()
     }
 }
 
