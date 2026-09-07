@@ -115,7 +115,7 @@ struct AppConfig: Codable {
                 // переводом строки (см. Runner).
                 auth: AuthSpec(user: "your-user",
                                passwordPrompt: #"(?i)^password\b[^\n]{0,40}$"#,
-                               otpPrompt: #"(?i)^(otp|token|code|passcode|answer|challenge|verification|second|password)\b[^\n]{0,40}$"#,
+                               otpPrompt: #"(?i)^(otp|token|code|passcode|answer|response|challenge|verification|second|password|pin)\b[^\n]{0,40}$"#,
                                failurePattern: AuthSpec.defaultFailurePattern,
                                timeoutSec: 120),
                 // Требует свежий OTP — автоматически поднять нельзя.
