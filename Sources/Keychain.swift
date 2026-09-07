@@ -47,5 +47,22 @@ enum Keychain {
         return SecItemDelete(q as CFDictionary) == errSecSuccess
     }
 
-    static func has(account: String) -> Bool { get(account: account) != nil }
+    /// Проверяет только наличие записи, не читая сам пароль.
+    ///
+    /// Через get() делать это нельзя: kSecReturnData заставляет систему
+    /// расшифровать значение, а расшифровка требует подтверждения доступа к
+    /// связке ключей. Панель вызывает эту проверку при каждой отрисовке —
+    /// из-за чего виджет просил пароль просто при открытии. Запрос одних
+    /// атрибутов проходит молча.
+    static func has(account: String) -> Bool {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnAttributes as String: true,
+        ]
+        var out: CFTypeRef?
+        return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess
+    }
 }

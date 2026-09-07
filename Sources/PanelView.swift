@@ -10,6 +10,9 @@ struct PanelView: View {
     @State private var needPassword = false
     @State private var launchAtLogin = LoginItem.isEnabled
     @State private var loginNeedsApproval = LoginItem.needsApproval
+    /// Кешируем: SwiftUI пересчитывает тело часто, а лишние обращения к
+    /// связке ключей ни к чему даже когда они бесплатны.
+    @State private var hasPassword = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -27,6 +30,7 @@ struct PanelView: View {
         .onAppear {
             launchAtLogin = LoginItem.isEnabled
             loginNeedsApproval = LoginItem.needsApproval
+            refreshPasswordState()
         }
     }
 
@@ -189,11 +193,11 @@ struct PanelView: View {
 
             HStack(spacing: 10) {
                 if let auth = monitor.vpns.compactMap({ $0.spec.auth }).first {
-                    if Keychain.has(account: auth.user) {
+                    if hasPassword {
                         Button("Изменить пароль") { beginPasswordChange(auth) }
                         Button("Удалить пароль") {
                             Keychain.delete(account: auth.user)
-                            monitor.objectWillChange.send()
+                            refreshPasswordState()
                         }
                     } else {
                         Text("пароль Aton не сохранён")
@@ -230,7 +234,7 @@ struct PanelView: View {
         }
         // После отказа сервера пароль из связки ключей заведомо не подошёл —
         // спрашиваем заново, иначе повторили бы ту же неверную попытку.
-        needPassword = !Keychain.has(account: auth.user) || vpn.authFailed
+        needPassword = !hasPassword || vpn.authFailed
         otp = ""; password = ""
         authTarget = vpn.id
     }
@@ -247,13 +251,20 @@ struct PanelView: View {
     private func submitAuth(_ vpn: VPNRuntime) {
         guard let auth = vpn.spec.auth else { return }
         if needPassword && !password.isEmpty {
-            if !Keychain.set(password, account: auth.user) {
+            if Keychain.set(password, account: auth.user) {
+                refreshPasswordState()
+            } else {
                 Log.shared.error("Не удалось записать пароль в связку ключей")
             }
         }
         let code = otp
         resetAuth()
         Task { await monitor.connect(id: vpn.id, otp: code) }
+    }
+
+    private func refreshPasswordState() {
+        hasPassword = monitor.vpns.compactMap { $0.spec.auth }
+            .contains { Keychain.has(account: $0.user) }
     }
 
     private func resetAuth() {
