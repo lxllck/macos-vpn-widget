@@ -121,23 +121,52 @@ enum Runner {
                     .last { !$0.isEmpty } ?? ""
             }
 
-            func tryAnswer(idle: Bool) {
+            // Непечатаемые символы делаем видимыми: строка может выглядеть
+            // в логе как "OTP", а на деле содержать управляющие escape-коды,
+            // из-за которых шаблон не совпадает.
+            func escaped(_ s: String) -> String {
+                s.unicodeScalars.map { sc -> String in
+                    (sc.value < 32 || sc.value == 127)
+                        ? String(format: "\\x%02X", sc.value) : String(sc)
+                }.joined()
+            }
+
+            var reportedMismatch = false
+
+            func tryAnswer(silentFor: TimeInterval) {
                 lock.lock()
                 guard failureReason == nil, let step = pending.first else {
                     lock.unlock(); return
                 }
                 let line = lastLine(tail)
-                guard idle || !tail.hasSuffix("\n"), !line.isEmpty,
-                      line.range(of: step.pattern, options: .regularExpression) != nil else {
+                guard !line.isEmpty else { lock.unlock(); return }
+
+                let matches = line.range(of: step.pattern, options: .regularExpression) != nil
+                let waiting = !tail.hasSuffix("\n") || silentFor > 0.6
+                // Запасной путь: программа молчит уже долго, а у нас есть
+                // готовый ответ. Ответить не по шаблону лучше, чем висеть до
+                // таймаута — порог большой, чтобы не влезть в паузу, пока
+                // openconnect ждёт ответа сервера.
+                let fallback = silentFor > 6.0
+
+                guard (matches && waiting) || fallback else {
+                    if waiting && !matches && !reportedMismatch {
+                        reportedMismatch = true
+                        lock.unlock()
+                        onOutput?("[ожидание на «\(escaped(line))» — шаблон не совпал]")
+                        return
+                    }
                     lock.unlock(); return
                 }
+
                 let reply = step.reply + "\n"
                 _ = reply.withCString { write(master, $0, strlen($0)) }
                 pending.removeFirst()
                 tail = ""
                 pendingPrompt = ""
+                reportedMismatch = false
                 lock.unlock()
-                onOutput?("[промпт «\(line)» — ответ отправлен]")
+                onOutput?("[промпт «\(escaped(line))»\(matches ? "" : " — по молчанию, шаблон не совпал") — ответ отправлен]")
             }
 
             while true {
@@ -145,7 +174,7 @@ enum Runner {
                 let pr = poll(&pfd, 1, 200)
                 if pr < 0 { if errno == EINTR { continue }; break }
                 if pr == 0 {
-                    if Date().timeIntervalSince(lastData) > 0.6 { tryAnswer(idle: true) }
+                    tryAnswer(silentFor: Date().timeIntervalSince(lastData))
                     continue
                 }
                 let n = read(master, &buf, buf.count)
@@ -184,10 +213,11 @@ enum Runner {
                     }
                 }
                 if tail.count > 8192 { tail = String(tail.suffix(4096)) }
+                reportedMismatch = false
                 lock.unlock()
 
                 for line in lines { onOutput?(redact(line)) }
-                tryAnswer(idle: false)
+                tryAnswer(silentFor: 0)
             }
             readerDone.signal()
         }
