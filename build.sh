@@ -9,7 +9,12 @@ DEST="${1:-/Applications}"
 echo "==> компиляция"
 rm -rf build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -o "$APP/Contents/MacOS/VPNWidget" Sources/*.swift 2>&1 \
+# Версию платформы задаём явно. По умолчанию swiftc проставляет её на
+# основе установленных Command Line Tools, и при рассинхроне с системой
+# получается минимум ВЫШЕ текущей ОС — тогда LaunchServices отказывается
+# запускать приложение с kLSIncompatibleSystemVersionErr.
+TARGET="$(uname -m)-apple-macosx14.0"
+swiftc -O -target "$TARGET" -o "$APP/Contents/MacOS/VPNWidget" Sources/*.swift 2>&1 \
   | grep -v '^$' || true
 [ -x "$APP/Contents/MacOS/VPNWidget" ] || { echo "сборка не удалась"; exit 1; }
 
