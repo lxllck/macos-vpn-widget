@@ -315,6 +315,53 @@ enum Runner {
         return p.terminationStatus
     }
 
+    /// Короткая команда БЕЗ псевдотерминала.
+    ///
+    /// Именно без: получив терминал, ssh-add может запросить парольную фразу
+    /// и подвесить подключение. Без tty он либо берёт её из связки ключей,
+    /// либо сразу возвращает ошибку.
+    static func run(argv: [String], env extraEnv: [String: String] = [:],
+                    timeout: Double = 20) -> RunResult {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: argv[0])
+        p.arguments = Array(argv.dropFirst())
+        var environment = ProcessInfo.processInfo.environment
+        extraEnv.forEach { environment[$0.key] = $0.value }
+        p.environment = environment
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else {
+            return RunResult(exitCode: -1, output: "не удалось запустить \(argv[0])",
+                             timedOut: false, unansweredPrompt: false)
+        }
+
+        // Читаем в отдельном потоке: иначе потомок встанет на заполненном канале.
+        let lock = NSLock()
+        var data = Data()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = pipe.fileHandleForReading.readDataToEndOfFile()
+            lock.lock(); data = d; lock.unlock()
+            done.signal()
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var timedOut = false
+        while p.isRunning {
+            if Date() >= deadline { timedOut = true; p.terminate(); break }
+            usleep(50_000)
+        }
+        _ = done.wait(timeout: .now() + 2)
+        p.waitUntilExit()
+        lock.lock(); let out = String(decoding: data, as: UTF8.self); lock.unlock()
+
+        return RunResult(exitCode: timedOut ? -2 : p.terminationStatus,
+                         output: out.trimmingCharacters(in: .whitespacesAndNewlines),
+                         timedOut: timedOut, unansweredPrompt: false)
+    }
+
     /// Полная таблица процессов одним вызовом — дешевле, чем дёргать
     /// ps/pgrep отдельно для каждого процесса на каждом опросе.
     /// etime даёт настоящий возраст туннеля, а не время с запуска виджета.

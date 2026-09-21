@@ -386,6 +386,7 @@ final class VPNMonitor: ObservableObject {
         let title = spec.title
         let result = await withCheckedContinuation { (c: CheckedContinuation<RunResult, Never>) in
             cmdQueue.async {
+                Self.prepareSSHKeys(spec)
                 c.resume(returning: Runner.runPTY(
                     argv: cmd, env: ["PATH": self.config.childPath],
                     answers: steps, failurePattern: spec.auth?.failureRegex,
@@ -407,6 +408,32 @@ final class VPNMonitor: ObservableObject {
         finish(i, error: error)
     }
 
+    /// Загружает ключи в ssh-agent перед запуском.
+    ///
+    /// Виджет работает от имени пользователя, поэтому связка ключей ему
+    /// доступна и парольная фраза берётся оттуда молча. Запускаемому под
+    /// sudo sshuttle связка уже недоступна — ему остаётся только агент,
+    /// а тот пуст после каждой перезагрузки. Команда идемпотентна, так что
+    /// вызывать её перед каждым подключением безопасно.
+    private nonisolated static func prepareSSHKeys(_ spec: VPNSpec) {
+        for raw in spec.sshKeys ?? [] {
+            let path = NSString(string: raw).expandingTildeInPath
+            guard FileManager.default.fileExists(atPath: path) else {
+                Log.shared.warn("\(spec.title): ключ \(path) не найден")
+                continue
+            }
+            // SSH_ASKPASS_REQUIRE=never — чтобы при отсутствии фразы в связке
+            // ключей команда сразу упала, а не полезла спрашивать.
+            let r = Runner.run(argv: ["/usr/bin/ssh-add", "--apple-use-keychain", path],
+                               env: ["SSH_ASKPASS_REQUIRE": "never"], timeout: 15)
+            if r.succeeded {
+                Log.shared.info("\(spec.title): ключ \(path) загружен в ssh-agent")
+            } else {
+                Log.shared.warn("\(spec.title): ключ \(path) не загружен — \(r.output)")
+            }
+        }
+    }
+
     /// Вывод openconnect многословный — вытаскиваем то, что объясняет отказ.
     private static func explain(_ r: RunResult, spec: VPNSpec) -> String {
         // Отказ сервера — самая частая причина, и он должен называться
@@ -421,6 +448,9 @@ final class VPNMonitor: ObservableObject {
         if out.contains("login failed") || out.contains("authentication failure")
             || out.contains("invalid") {
             return "Аутентификация не прошла — проверьте пароль и OTP"
+        }
+        if out.contains("permission denied (publickey") || out.contains("failed to establish ssh session") {
+            return "SSH-ключ не принят. Обычно после перезагрузки — ключ с парольной фразой пропал из ssh-agent."
         }
         if out.contains("command not found") {
             return "Не найден sshuttle/openconnect — проверьте PATH в config.json"

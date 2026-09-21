@@ -54,6 +54,13 @@ struct VPNSpec: Codable, Equatable {
     var processes: [ProcSpec]
     var probe: ProbeSpec?
     var auth: AuthSpec?
+    /// SSH-ключи, которые надо иметь в ssh-agent до запуска.
+    ///
+    /// sshuttle работает под sudo, а root не имеет доступа к связке ключей
+    /// пользователя — поэтому парольную фразу он взять не может и опирается
+    /// только на агент. После перезагрузки агент пуст, и подключение молча
+    /// падает с «Permission denied (publickey)».
+    var sshKeys: [String]?
     var autoReconnectAllowed: Bool
 
     var badge: String { short ?? String(title.prefix(2)) }
@@ -87,6 +94,7 @@ struct AppConfig: Codable {
                 probe: ProbeSpec(host: "203.0.113.10", port: 22,
                                  timeoutMs: 4000, expectBanner: true),
                 auth: nil,
+                sshKeys: ["~/.ssh/amnezia-server"],
                 autoReconnectAllowed: true
             ),
             VPNSpec(
@@ -118,6 +126,7 @@ struct AppConfig: Codable {
                                otpPrompt: #"(?i)^(otp|token|code|passcode|answer|response|challenge|verification|second|password|pin)\b[^\n]{0,40}$"#,
                                failurePattern: AuthSpec.defaultFailurePattern,
                                timeoutSec: 120),
+                sshKeys: ["~/.ssh/id_rsa"],
                 // Требует свежий OTP — автоматически поднять нельзя.
                 autoReconnectAllowed: false
             )

@@ -228,7 +228,7 @@ struct PanelView: View {
     // MARK: Логика
 
     private func beginConnect(_ vpn: VPNRuntime) {
-        guard let auth = vpn.spec.auth else {
+        guard vpn.spec.auth != nil else {
             Task { await monitor.connect(id: vpn.id, otp: nil) }
             return
         }
